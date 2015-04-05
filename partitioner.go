@@ -1,5 +1,12 @@
 package main
 
+import (
+	"fmt"
+	. "github.com/yvasiyarov/php_session_decoder"
+	"io/ioutil"
+	"net/http"
+)
+
 func getPhpSession(sessionId string) (PhpSession, error) {
 	sessionFile := fmt.Sprintf("/var/tmp/sess_%s", sessionId)
 	sessionBytes, err := ioutil.ReadFile(sessionFile)
@@ -16,15 +23,15 @@ func getPhpSession(sessionId string) (PhpSession, error) {
 	return session, nil
 }
 
-func extractLoggedInAs() (int, error) {
+func extractLoggedInAs(req *http.Request) (int, error) {
 	sessionCookie, err := req.Cookie("PHPSESSID")
-	if err {
+	if err != nil {
 		return 0, nil
 	}
 
 	var session PhpSession
 	session, err = getPhpSession(sessionCookie.Value)
-	if err {
+	if err != nil {
 		return 0, nil
 	}
 
@@ -32,17 +39,20 @@ func extractLoggedInAs() (int, error) {
 	if !ok {
 		return 0, nil
 	} else {
-		return id, nil
+		return id.(int), nil
 	}
 }
 
+/*
 func PartitionerMemberIn(req *http.Request) (http.Request, error) {
 	// Extract Member ID based on Cookie.
 	//
 	// Inject header.
+	return nil, nil
 }
 
 func PartitionerMemberOut(req *http.Request) (http.Request, error) {
 	// Noop?
-
+	return nil, nil
 }
+*/

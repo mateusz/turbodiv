@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -87,30 +88,85 @@ func (t *Turbodiv) ServeHTTP(respWriter http.ResponseWriter, req *http.Request) 
 	buffering := newBufferingResponseWriter(respWriter)
 	proxy.ServeHTTP(buffering, req)
 
-	var (
-		doc *html.Node
-		err error
-	)
-	if doc, err = html.Parse(&buffering.BodyBuffer); err == nil {
-		fmt.Printf("Parsing\n")
-		// Iteratively descend into the node tree to find esi tags.
-		var descend func(*html.Node)
-		descend = func(n *html.Node) {
-			if n.Type == html.ElementNode && n.Data == "esi:include" {
-				fmt.Printf("Found esi tag!\n")
-			}
-			for c := n.FirstChild; c != nil; c = c.NextSibling {
-				descend(c)
-			}
+	// Use regexp, because we don't want to force normalisation of HTML.
+	// We are looking for esi tags, such as:
+	// <esi:include
+	//		src="http://some/url"
+	//		processor="replace"
+	//		partitioner="Member" />
+	// Maybe use regexp templates instead? (the Expand fn)
+	esi := regexp.MustCompile("<esi:include[^>]*>")
+	newBytes := esi.ReplaceAllFunc(buffering.BodyBuffer.Bytes(), func(match []byte) []byte {
+		// We are going to replace the esi tag though, so we can parse this properly.
+		var (
+			snippet *html.Node
+			err     error
+		)
+
+		if snippet, err = html.Parse(bytes.NewBuffer(match)); err != nil {
+			return []byte("<!-- invalid esi tag -->")
 		}
-		descend(doc)
 
-	}
+		// Iteratively descend into the node tree to find esi tags.
+		var descend func(*html.Node) ([]byte, bool)
+		descend = func(node *html.Node) ([]byte, bool) {
+			if node.Type == html.ElementNode && node.Data == "esi:include" {
 
-	// Write parsed content.
-	buffering.BodyBuffer.Reset()
-	html.Render(&buffering.BodyBuffer, doc)
+				// Process the esi:include
+				extraAttr := make(map[string]string)
+				var (
+					src       string
+					processor Processor
+				)
 
+				for _, attr := range node.Attr {
+					switch {
+					default:
+						extraAttr[attr.Key] = attr.Val
+					case attr.Key == "src":
+						src = attr.Val
+					case attr.Key == "processor":
+						switch attr.Val {
+						case "replace":
+							processor = ReplaceProcessor{}
+						}
+					}
+				}
+
+				// We have found a legit esi tag - no point in searching any further.
+				if src != "" && processor != nil {
+					if replacement, err := processor.Process(req, src, extraAttr); err == nil {
+						return replacement, true
+					}
+				}
+
+			}
+
+			// Descend into sub-nodes, looking for first match. We are still within the string matched by regexp.
+			for child := node.FirstChild; child != nil; child = child.NextSibling {
+				if replacement, found := descend(child); found {
+					return replacement, true
+				}
+			}
+
+			// Nothing of interest found. Could be no tag, or broken tag in the matched string.
+			return nil, false
+		}
+
+		var (
+			replacement []byte
+			found       bool
+		)
+
+		if replacement, found = descend(snippet); !found {
+			return []byte("<!-- invalid esi tag -->")
+		}
+
+		return replacement
+
+	})
+
+	buffering.ReplaceBody(newBytes)
 	buffering.Flush()
 
 	// Check Cache-Control header to see if we need to do anything special in the future for this URL.
@@ -164,6 +220,12 @@ func (rw *bufferingResponseWriter) Flush() (int, error) {
 	copyHeader(rw.OriginalWriter.Header(), rw.HeaderBuffer)
 	rw.OriginalWriter.WriteHeader(rw.CodeBuffer)
 	return rw.OriginalWriter.Write(rw.BodyBuffer.Bytes())
+}
+
+func (rw *bufferingResponseWriter) ReplaceBody(newBytes []byte) {
+	rw.BodyBuffer.Reset()
+	rw.BodyBuffer.Write(newBytes)
+	rw.Header().Set("Content-Length", fmt.Sprintf("%d", len(newBytes)))
 }
 
 func copyHeader(dst, src http.Header) {
