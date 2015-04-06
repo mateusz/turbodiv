@@ -2,70 +2,28 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"golang.org/x/net/html"
-	"io/ioutil"
 	"net/http"
-	"net/url"
 	"regexp"
+	"sync"
 )
 
 type Processor interface {
-	Process(origReq *http.Request, src string, extraAttr map[string]string) (*EsiResponse, error)
+	Process(origReq *http.Request, body []byte) ([]byte, error)
 }
 
 type IncludeProcessor struct {
 	Turbodiv *Turbodiv
 }
 
-// Produce a new side request based on the original request.
-func (p IncludeProcessor) newSideReq(origReq *http.Request, urlStr string) *http.Request {
-	var url *url.URL
-	if urlStr == "" {
-		// Deep copy the URL. This is probably totally wrong :-)
-		newUrl := *origReq.URL
-		if origReq.URL.User != nil {
-			user := *(origReq.URL.User)
-			newUrl.User = &user
-		}
-		url = &newUrl
-	} else {
-		url, _ = url.Parse(urlStr)
-	}
-
-	// Find appropriate backend.
-	var backendUrlString string
-	var ok bool
-	if backendUrlString, ok = p.Turbodiv.Config.BackendMappings[url.Host]; !ok {
-		backendUrlString = p.Turbodiv.Config.BackendMappings["default"]
-	}
-	backendUrl, _ := url.Parse(backendUrlString)
-	// Overwrite the host & scheme by using the backend mapping.
-	url.Host = backendUrl.Host
-	url.Scheme = backendUrl.Scheme
-
-	// Bypass NewRequest for better control - e.g. we have parsed the url already.
-	req := &http.Request{
-		Method:     "GET",
-		URL:        url,
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Header:     make(http.Header),
-		Host:       backendUrl.Host,
-	}
-	copyHeader(req.Header, origReq.Header)
-	return req
-}
-
-func (p IncludeProcessor) esiReplacer(match []byte) []byte {
+func (p IncludeProcessor) resolveEsi(origReq *http.Request, esi []byte) []byte {
 	// The match string should contain only the esi tag as matched by regexp, might as well parse this properly.
 	var (
 		snippet *html.Node
 		err     error
 	)
 
-	if snippet, err = html.Parse(bytes.NewBuffer(match)); err != nil {
+	if snippet, err = html.Parse(bytes.NewBuffer(esi)); err != nil {
 		return []byte("<!-- invalid esi tag -->")
 	}
 
@@ -88,7 +46,9 @@ func (p IncludeProcessor) esiReplacer(match []byte) []byte {
 
 			// We have found a legit esi tag - no point in searching any further.
 			if src != "" {
-				return []byte("TESTING"), true
+				sideResp, _ := p.Turbodiv.SideRequest(origReq, src)
+				// TODO This... probably works. SS is generating something fun - including a var_dump :-)
+				return sideResp.Body, true
 			}
 
 		}
@@ -117,56 +77,63 @@ func (p IncludeProcessor) esiReplacer(match []byte) []byte {
 
 }
 
-func (p IncludeProcessor) Process(origReq *http.Request, src string, extraAttr map[string]string) (*EsiResponse, error) {
-	// Do the side-req.
-	sideReq := p.newSideReq(origReq, src)
+// Mutex-protected buffer.
+type concurrentBuffer struct {
+	sync.RWMutex
+	Buffer []byte
+}
 
-	client := &http.Client{}
-	resp, err := client.Do(sideReq)
-	if err != nil {
-		fmt.Printf("%#v\n", err)
+func (cb *concurrentBuffer) FindAll(re *regexp.Regexp) [][]byte {
+	cb.RLock()
+	defer cb.RUnlock()
+	return re.FindAll(cb.Buffer, -1)
+}
+
+func (cb *concurrentBuffer) Replace(src []byte, dst []byte) {
+	cb.Lock()
+	defer cb.Unlock()
+	cb.Buffer = bytes.Replace(cb.Buffer, src, dst, -1)
+}
+
+// Processes the body in place.
+func (p IncludeProcessor) Process(origReq *http.Request, body []byte) ([]byte, error) {
+	cbuf := concurrentBuffer{
+		Buffer: body,
 	}
-	defer resp.Body.Close()
 
-	// Drain the buffer so that we can perform the replacements.
-	body, _ := ioutil.ReadAll(resp.Body)
-
-	// We cannot pass the response straight to the original client, because we want to do our substitutions.
-	// Use regexp, because we don't want to force normalisation of HTML.
 	// We are looking for esi tags, such as:
 	// <esi:include
 	//		src="http://some/url"
 	//		action="replace"
 	//		partitioner="Member" />
-	// Maybe use regexp templates instead? (the Expand fn)
+	// Use regexp, because we don't want to force normalisation of HTML.
+	// We want to execute in parallel so we cannot use regexp.ReplaceAllFunc.
 	esi := regexp.MustCompile("<esi:include[^>]*>")
-	newBytes := esi.ReplaceAllFunc(body, p.esiReplacer)
+	var wg sync.WaitGroup
 
-	esiResp := &EsiResponse{
-		Code:   resp.StatusCode,
-		Header: resp.Header,
-		Body:   newBytes,
-	}
+	// This here will continue fetching until all esi tags have been replaced.
+	// It will fetch esi tags within esi tags... probably :-)
+	manyMatched := cbuf.FindAll(esi)
+	for manyMatched != nil {
 
-	return esiResp, nil
-}
+		for _, match := range manyMatched {
+			// TODO We should really only fetch the esi tags we are not already fetching. Some normalisation would be needed.
+			wg.Add(1)
+			go func(match []byte) {
+				defer wg.Done()
 
-type EsiResponse struct {
-	Code   int
-	Header http.Header
-	Body   []byte
-}
+				// Actual HTTP request happens inside.
+				resolved := p.resolveEsi(origReq, match)
+				cbuf.Replace(match, resolved)
+			}(match)
 
-func (e EsiResponse) WriteTo(to http.ResponseWriter) {
-	copyHeader(to.Header(), e.Header)
-	to.WriteHeader(e.Code)
-	to.Write(e.Body)
-}
-
-func copyHeader(dst, src http.Header) {
-	for k, vv := range src {
-		for _, v := range vv {
-			dst.Add(k, v)
 		}
+
+		// TODO This could let us go as soon as the first answer is returned. No such functionality in the library though.
+		wg.Wait()
+		// Subsequent round of esi fetches begins here.
+		manyMatched = cbuf.FindAll(esi)
 	}
+
+	return cbuf.Buffer, nil
 }
